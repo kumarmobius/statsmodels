@@ -1,6 +1,4 @@
-name: VAR Impulse Response Function Calculator
-description: Fit Vector Autoregression (VAR) model and compute orthogonalized impulse response functions. Outputs recovery curve in schema JSON format with shape and values.
-
+name: VAR Impulse Response Function Calculator v1.1
 inputs:
   - {name: input_data, type: Data, description: "Input time series data (CSV or Parquet with datetime index)"}
   - {name: var_lags, type: Integer, description: "Number of lags for VAR model", default: "10"}
@@ -21,6 +19,13 @@ implementation:
   container:
     image: gurpreetgandhi/nesy-factory:v1
     command:
+      - sh
+      - -c
+      - |
+        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location \
+          'statsmodels' \
+          'scipy>=1.11.0'
+        exec "$0" "$@"
       - python3
       - -u
       - -c
