@@ -1,0 +1,224 @@
+name: Dataset downloader and preprocessor (Parquet output)
+inputs:
+  - {name: data_cdn, type: String, optional: false}
+  - {name: apply_scaling, type: String, optional: true, default: "true"}
+  - {name: convert_to_float16, type: String, optional: true, default: "false"}
+
+outputs:
+  - {name: preprocessed_output, type: Data}
+  - {name: scaler_output, type: Data}
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:v1
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, tempfile, json, logging, pickle
+        import numpy as np
+        import pandas as pd
+        import torch
+        import requests
+        from requests.adapters import HTTPAdapter
+        try:
+            from urllib3.util import Retry
+        except Exception:
+            from urllib3 import Retry
+        from sklearn.preprocessing import StandardScaler
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--data_cdn', required=True)
+        parser.add_argument('--apply_scaling', type=str, default='true')
+        parser.add_argument('--convert_to_float16', type=str, default='false')
+        parser.add_argument('--preprocessed_output', required=True)
+        parser.add_argument('--scaler_output', required=True)
+        args = parser.parse_args()
+
+        logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+        logger = logging.getLogger("dataset_preprocessor")
+
+        apply_scaling      = args.apply_scaling.lower() in ('true', '1', 'yes')
+        convert_to_float16 = args.convert_to_float16.lower() in ('true', '1', 'yes')
+
+        logger.info("=" * 60)
+        logger.info("Configuration:")
+        logger.info(f"  Apply StandardScaler  : {apply_scaling}")
+        logger.info(f"  Convert to float16    : {convert_to_float16}")
+        logger.info("=" * 60)
+
+        # ── Retry-enabled session ──────────────────────────────────────────
+        session = requests.Session()
+        retry = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        session.mount("http://",  HTTPAdapter(max_retries=retry))
+        session.mount("https://", HTTPAdapter(max_retries=retry))
+
+        # ── Helpers ────────────────────────────────────────────────────────
+        def debug_array(arr, name="array"):
+            nan_count = np.isnan(arr).sum()
+            inf_count = np.isinf(arr).sum()
+            total     = arr.size
+            logger.info("=" * 55)
+            logger.info(f"[DEBUG] {name}")
+            logger.info(f"  Shape       : {arr.shape}")
+            logger.info(f"  Dtype       : {arr.dtype}")
+            logger.info(f"  Total values: {total:,}")
+            logger.info(f"  NaN count   : {nan_count:,}  ({100*nan_count/total:.4f}%)")
+            logger.info(f"  Inf count   : {inf_count:,}  ({100*inf_count/total:.4f}%)")
+            valid = np.isfinite(arr)
+            if valid.any():
+                logger.info(f"  Min value   : {arr[valid].min():.6f}")
+                logger.info(f"  Max value   : {arr[valid].max():.6f}")
+                logger.info(f"  Mean value  : {arr[valid].mean():.6f}")
+                logger.info(f"  Std value   : {arr[valid].std():.6f}")
+            logger.info("=" * 55)
+
+        def clean_array(arr, name="array"):
+            nan_before = np.isnan(arr).sum()
+            inf_before = np.isinf(arr).sum()
+            if nan_before == 0 and inf_before == 0:
+                logger.info(f"[CLEAN] {name}: ✓ No NaN or Inf — no cleaning needed")
+                return arr
+            logger.warning(f"[CLEAN] {name}: Replacing {nan_before:,} NaN and {inf_before:,} Inf with 0")
+            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+            logger.info(f"[CLEAN] {name}: After → NaN: {np.isnan(arr).sum()}, Inf: {np.isinf(arr).sum()}")
+            return arr
+
+        def download_file(url):
+            logger.info("Downloading from: %s", url)
+            r = session.get(url, timeout=60)
+            r.raise_for_status()
+            fd, tmp = tempfile.mkstemp()
+            os.close(fd)
+            with open(tmp, "wb") as f:
+                f.write(r.content)
+            logger.info("Downloaded to: %s", tmp)
+            return tmp
+
+        def load_data(file_path):
+            strategies = [
+                ('PyTorch .pt',  lambda: torch.load(file_path, map_location='cpu').numpy()),
+                ('NumPy .npy',   lambda: np.load(file_path, allow_pickle=True)),
+                ('NumPy .npz',   lambda: np.load(file_path, allow_pickle=True)['data']),
+                ('Parquet',      lambda: pd.read_parquet(file_path, engine='pyarrow').values),
+                ('CSV',          lambda: pd.read_csv(file_path).values),
+                ('Excel',        lambda: pd.read_excel(file_path).values),
+                ('TSV',          lambda: pd.read_csv(file_path, sep='\t').values),
+            ]
+            last_err = None
+            for name, fn in strategies:
+                try:
+                    logger.info("Trying to load as: %s", name)
+                    data = fn()
+                    if isinstance(data, torch.Tensor):
+                        data = data.numpy()
+                    data = np.array(data, dtype=np.float32)
+                    logger.info("✓ Loaded as %s — shape: %s", name, data.shape)
+                    return data
+                except Exception as e:
+                    last_err = e
+            raise RuntimeError(f"Could not load file in any supported format. Last error: {last_err}")
+
+        def save_as_parquet(arr, output_dir, filename="preprocessed_data"):
+            os.makedirs(output_dir, exist_ok=True)
+            cols = [f"feature_{i}" for i in range(arr.shape[1])] if arr.ndim == 2 else ["value"]
+            df   = pd.DataFrame(arr, columns=cols)
+            out_path = os.path.join(output_dir, f"{filename}.parquet")
+            df.to_parquet(out_path, index=False, engine="pyarrow")
+            logger.info("✓ Saved parquet to: %s  (rows=%d, cols=%d)", out_path, *df.shape)
+            # sidecar metadata
+            with open(output_dir + ".meta.json", "w") as f:
+                json.dump({"parquet_path": out_path, "shape": list(arr.shape),
+                           "dtype": str(arr.dtype)}, f, indent=2)
+            return out_path
+
+        # ── Main pipeline ──────────────────────────────────────────────────
+        try:
+            # 1. Download & load
+            tmp_file = download_file(args.data_cdn)
+            data = load_data(tmp_file)
+            os.remove(tmp_file)
+
+            # 2. Debug raw
+            debug_array(data, name="raw data")
+
+            # 3. Clean (NaN / Inf → 0)
+            data = clean_array(data, name="data")
+            debug_array(data, name="data (after clean)")
+
+            # 4. Optional StandardScaler
+            scaler = None
+            if apply_scaling:
+                logger.info("=" * 60)
+                logger.info("Fitting & applying StandardScaler on full dataset")
+                logger.info("=" * 60)
+                scaler = StandardScaler()
+                data   = scaler.fit_transform(data).astype(np.float32)
+                logger.info("✓ Scaling done")
+                logger.info(f"  Mean range : [{scaler.mean_.min():.6f}, {scaler.mean_.max():.6f}]")
+                logger.info(f"  Std  range : [{scaler.scale_.min():.6f}, {scaler.scale_.max():.6f}]")
+                logger.info(f"  Data range : [{data.min():.6f}, {data.max():.6f}]")
+
+                # Save scaler artefacts
+                os.makedirs(args.scaler_output, exist_ok=True)
+                scaler_pkl = os.path.join(args.scaler_output, "scaler.pkl")
+                with open(scaler_pkl, "wb") as f:
+                    pickle.dump(scaler, f)
+                scaler_stats = {
+                    "mean": scaler.mean_.tolist(),
+                    "std":  scaler.scale_.tolist(),
+                    "n_features": scaler.n_features_in_,
+                    "n_samples_seen": int(scaler.n_samples_seen_),
+                }
+                stats_path = os.path.join(args.scaler_output, "scaler_stats.json")
+                with open(stats_path, "w") as f:
+                    json.dump(scaler_stats, f, indent=2)
+                with open(args.scaler_output + ".meta.json", "w") as f:
+                    json.dump({"scaler_path": scaler_pkl, "stats_path": stats_path,
+                               "n_features": scaler.n_features_in_, "applied": True}, f, indent=2)
+                logger.info("✓ Scaler saved to: %s", scaler_pkl)
+            else:
+                logger.info("⚠ Scaling disabled — using raw (cleaned) data")
+                os.makedirs(args.scaler_output, exist_ok=True)
+                with open(args.scaler_output + ".meta.json", "w") as f:
+                    json.dump({"applied": False}, f, indent=2)
+
+            # 5. Optional float16 conversion
+            if convert_to_float16:
+                logger.info("Converting to float16 …")
+                float16_max = 65504.0
+                abs_max = np.abs(data).max()
+                if abs_max > float16_max:
+                    logger.warning("⚠ Values (%.2f) exceed float16 max — clipping!", abs_max)
+                    data = np.clip(data, -float16_max, float16_max)
+                data = data.astype(np.float16)
+                logger.info("✓ Converted to float16")
+
+            # 6. Save as Parquet
+            out_path = save_as_parquet(data, args.preprocessed_output)
+
+            logger.info("=" * 60)
+            logger.info("✓ Pipeline complete!")
+            logger.info("  Output parquet : %s", out_path)
+            logger.info("  Final shape    : %s", data.shape)
+            logger.info("  Final dtype    : %s", data.dtype)
+            logger.info("  Scaling applied: %s", apply_scaling)
+            logger.info("  Float16        : %s", convert_to_float16)
+            logger.info("=" * 60)
+
+        except Exception as e:
+            logger.exception("Fatal error: %s", str(e))
+            sys.exit(1)
+
+    args:
+      - --data_cdn
+      - {inputValue: data_cdn}
+      - --apply_scaling
+      - {inputValue: apply_scaling}
+      - --convert_to_float16
+      - {inputValue: convert_to_float16}
+      - --preprocessed_output
+      - {outputPath: preprocessed_output}
+      - --scaler_output
+      - {outputPath: scaler_output}
