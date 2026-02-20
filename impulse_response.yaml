@@ -1,4 +1,4 @@
-name: VAR Impulse Response Function Calculator v1.2
+name: VAR Impulse Response Function Calculator v1.3
 inputs:
   - {name: input_data, type: Data, description: "Input time series data (CSV or Parquet with datetime index)"}
   - {name: var_lags, type: Integer, description: "Number of lags for VAR model", default: "10"}
@@ -153,14 +153,19 @@ implementation:
                     raise e
             
             # Add small regularization to covariance matrix for stability
-            if hasattr(var_results, 'sigma_u'):
-                # Add small constant to diagonal
-                epsilon = 1e-8
-                var_results.sigma_u = var_results.sigma_u + epsilon * np.eye(var_results.sigma_u.shape[0])
-                
-                # Recompute any cached values that depend on sigma_u
-                if hasattr(var_results, '_cov_params'):
-                    delattr(var_results, '_cov_params')
+            epsilon = 1e-6
+            eye = np.eye(var_results.sigma_u.shape[0])
+            
+            # Patch both sigma_u variants — statsmodels uses sigma_u_mle for info criteria
+            var_results.sigma_u     = var_results.sigma_u     + epsilon * eye
+            var_results.sigma_u_mle = var_results.sigma_u_mle + epsilon * eye
+            
+            # Clear all cached properties that depend on the covariance matrix
+            for cached_attr in ('_cov_params', 'info_criteria', '_lag_order_results'):
+                if hasattr(var_results, cached_attr):
+                    delattr(var_results, cached_attr)
+            
+            logger.info(f"✓ Covariance matrix regularized (epsilon={epsilon})")
             
             logger.info(f"✓ VAR model fitted")
             logger.info(f"  AIC: {var_results.aic:.4f}")
