@@ -1,4 +1,4 @@
-name: VAR Impulse Response Function 1.5
+name: VAR Impulse Response Function 1.7
 inputs:
   - {name: input_data, type: Data, description: "Input time series data (CSV or Parquet with datetime index)"}
   - {name: var_lags, type: Integer, description: "Number of lags for VAR model", default: "10"}
@@ -266,7 +266,7 @@ implementation:
 
             # Save cumulative IRF
             if use_orth:
-                cum_effects = irf.cum_effects_orth
+                cum_effects = irf.orth_cum_effects
             else:
                 cum_effects = irf.cum_effects
             np.save(os.path.join(args.irf_results, "irf_cumulative.npy"), cum_effects)
