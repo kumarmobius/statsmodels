@@ -1,19 +1,15 @@
-name: VAR Impulse Response Function 1.7
+name: VAR Impulse Response Function 1.8
 inputs:
   - {name: input_data, type: Data, description: "Input time series data (CSV or Parquet with datetime index)"}
   - {name: var_lags, type: Integer, description: "Number of lags for VAR model", default: "10"}
   - {name: irf_periods, type: Integer, description: "Number of periods for impulse response", default: "5"}
   - {name: orthogonalized, type: String, description: "Use orthogonalized IRF (true/false)", default: "true"}
-  - {name: impulse_variable, type: String, optional: true, description: "Specific variable to shock (leave empty for all variables)"}
-  - {name: response_variable, type: String, optional: true, description: "Specific response variable (leave empty for all variables)"}
   - {name: confidence_level, type: Float, description: "Confidence level for error bands (0-1)", default: "0.95"}
   - {name: n_bootstrap, type: Integer, description: "Number of bootstrap iterations for confidence intervals (0=disable)", default: "0"}
   - {name: seed, type: Integer, description: "Random seed for reproducibility", default: "42"}
 
 outputs:
   - {name: schema_json, type: String, description: "Schema JSON with recoverycurve (shape + values)"}
-  - {name: irf_results, type: Data, description: "Full IRF results including confidence intervals"}
-  - {name: var_diagnostics, type: Data, description: "VAR model diagnostics and statistics"}
 
 implementation:
   container:
@@ -47,18 +43,14 @@ implementation:
         logger = logging.getLogger("var_irf")
 
         parser = argparse.ArgumentParser()
-        parser.add_argument("--input_data",         type=str,   required=True)
-        parser.add_argument("--var_lags",           type=int,   required=True)
-        parser.add_argument("--irf_periods",        type=int,   required=True)
-        parser.add_argument("--orthogonalized",     type=str,   required=True)
-        parser.add_argument("--impulse_variable",   type=str,   default="")
-        parser.add_argument("--response_variable",  type=str,   default="")
-        parser.add_argument("--confidence_level",   type=float, required=True)
-        parser.add_argument("--n_bootstrap",        type=int,   required=True)
-        parser.add_argument("--seed",               type=int,   required=True)
-        parser.add_argument("--schema_json",        type=str,   required=True)
-        parser.add_argument("--irf_results",        type=str,   required=True)
-        parser.add_argument("--var_diagnostics",    type=str,   required=True)
+        parser.add_argument("--input_data",        type=str,   required=True)
+        parser.add_argument("--var_lags",          type=int,   required=True)
+        parser.add_argument("--irf_periods",       type=int,   required=True)
+        parser.add_argument("--orthogonalized",    type=str,   required=True)
+        parser.add_argument("--confidence_level",  type=float, required=True)
+        parser.add_argument("--n_bootstrap",       type=int,   required=True)
+        parser.add_argument("--seed",              type=int,   required=True)
+        parser.add_argument("--schema_json",       type=str,   required=True)
         args = parser.parse_args()
 
         def str_to_bool(s):
@@ -66,171 +58,95 @@ implementation:
 
         def ensure_dir_for(p):
             d = os.path.dirname(p)
-            if d and not os.path.exists(d):
+            if d:
                 os.makedirs(d, exist_ok=True)
 
         try:
             np.random.seed(args.seed)
-            logger.info(f"✓ Random seed set: {args.seed}")
+            use_orth = str_to_bool(args.orthogonalized)
 
-            # Load Data
-            logger.info("=" * 60)
+            # ── Load Data ──────────────────────────────────────────────
             logger.info("Loading Input Data")
-            logger.info("=" * 60)
-
             data_files = list(Path(args.input_data).glob("*.csv")) + \
                          list(Path(args.input_data).glob("*.parquet"))
             if not data_files:
                 raise FileNotFoundError(f"No CSV or Parquet file found in {args.input_data}")
 
             data_path = data_files[0]
-            logger.info(f"Loading: {data_path}")
-
             if data_path.suffix == ".csv":
                 data = pd.read_csv(data_path, index_col=0, parse_dates=True)
             else:
                 data = pd.read_parquet(data_path)
 
-            logger.info(f"✓ Data loaded: {data.shape}")
-            logger.info(f"  Columns: {list(data.columns)}")
-            logger.info(f"  Index range: {data.index[0]} to {data.index[-1]}")
+            logger.info(f"✓ Data loaded: {data.shape}, columns: {list(data.columns)}")
 
-            # Validate data
             if data.isnull().any().any():
-                logger.warning("⚠ Data contains NaN values — dropping rows with NaN")
                 data = data.dropna()
                 logger.info(f"  After dropping NaN: {data.shape}")
 
             if len(data) < args.var_lags + args.irf_periods + 10:
                 raise ValueError(
                     f"Insufficient data: {len(data)} rows. "
-                    f"Need at least {args.var_lags + args.irf_periods + 10} rows "
-                    f"for var_lags={args.var_lags} and irf_periods={args.irf_periods}"
+                    f"Need at least {args.var_lags + args.irf_periods + 10} rows."
                 )
 
-            # Fit VAR Model
-            logger.info("=" * 60)
-            logger.info("Fitting VAR Model")
-            logger.info("=" * 60)
-            logger.info(f"  Lags: {args.var_lags}")
-            logger.info(f"  Variables: {list(data.columns)}")
-            
-            # Add small jitter to data to prevent singular matrix
-            np.random.seed(args.seed)
-            jitter_strength = 1e-8
-            data_jittered = data + np.random.normal(0, jitter_strength, data.shape)
-            
+            # ── Fit VAR ────────────────────────────────────────────────
+            logger.info(f"Fitting VAR model (lags={args.var_lags})")
+            data_jittered = data + np.random.normal(0, 1e-8, data.shape)
             var_model = VAR(data_jittered)
-            
+
             try:
                 var_results = var_model.fit(maxlags=args.var_lags, ic=None)
-            except np.linalg.LinAlgError as e:
-                if "positive definite" in str(e):
-                    logger.warning("⚠ Singular matrix detected, applying stronger regularization...")
-                    
-                    # Apply stronger regularization
-                    jitter_strength = 1e-6
-                    data_jittered = data + np.random.normal(0, jitter_strength, data.shape)
-                    var_model = VAR(data_jittered)
-                    
-                    # Try with fewer lags if needed
-                    for lags in range(args.var_lags, 1, -1):
-                        try:
-                            logger.info(f"  Trying with {lags} lags...")
-                            var_results = var_model.fit(maxlags=lags, ic=None)
-                            logger.info(f"✓ Success with {lags} lags")
-                            break
-                        except np.linalg.LinAlgError:
-                            continue
-                    else:
-                        # If all fails, use pseudo-inverse method
-                        logger.warning("⚠ Using robust estimation method...")
-                        from statsmodels.tsa.api import VAR
-                        
-                        # Fit with simpler method
-                        var_results = var_model.fit(maxlags=min(5, args.var_lags), ic=None, method='ols')
-                else:
-                    raise e
-            
-            # Add small regularization to covariance matrix for stability
+            except np.linalg.LinAlgError:
+                logger.warning("⚠ Singular matrix — applying stronger regularization")
+                data_jittered = data + np.random.normal(0, 1e-6, data.shape)
+                var_model = VAR(data_jittered)
+                for lags in range(args.var_lags, 0, -1):
+                    try:
+                        var_results = var_model.fit(maxlags=lags, ic=None)
+                        logger.info(f"✓ Success with {lags} lags")
+                        break
+                    except np.linalg.LinAlgError:
+                        continue
+
+            # Regularize covariance matrix
             epsilon = 1e-6
             eye = np.eye(var_results.sigma_u.shape[0])
-            
-            # Patch both sigma_u variants — statsmodels uses sigma_u_mle for info criteria
             var_results.sigma_u     = var_results.sigma_u     + epsilon * eye
             var_results.sigma_u_mle = var_results.sigma_u_mle + epsilon * eye
-            
-            for cached_attr in ('_cov_params', 'info_criteria', '_lag_order_results'):
+
+            for cached_attr in ('_cov_params', '_lag_order_results'):
                 try:
                     if cached_attr in vars(var_results):
                         delattr(var_results, cached_attr)
                 except (AttributeError, TypeError):
                     pass
-            
-            logger.info(f"✓ Covariance matrix regularized (epsilon={epsilon})")
-            
-            logger.info(f"✓ VAR model fitted")
-            logger.info(f"  AIC: {var_results.aic:.4f}")
-            logger.info(f"  BIC: {var_results.bic:.4f}")
-            logger.info(f"  FPE: {var_results.fpe:.4f}")
-            logger.info(f"  HQIC: {var_results.hqic:.4f}")
-            logger.info(f"  Determinant of cov matrix: {var_results.detomega:.6f}")
 
-            # Compute Impulse Response
-            logger.info("=" * 60)
-            logger.info("Computing Impulse Response Functions")
-            logger.info("=" * 60)
-            logger.info(f"  Periods: {args.irf_periods}")
-            logger.info(f"  Orthogonalized: {args.orthogonalized}")
+            logger.info(f"✓ VAR fitted — AIC: {var_results.aic:.4f}, BIC: {var_results.bic:.4f}")
 
-            use_orth = str_to_bool(args.orthogonalized)
+            # ── Compute IRF ────────────────────────────────────────────
+            logger.info(f"Computing IRF (periods={args.irf_periods}, orth={use_orth})")
+            irf = var_results.irf(args.irf_periods)
 
-            # Compute IRF
             if args.n_bootstrap > 0:
-                logger.info(f"  Bootstrap iterations: {args.n_bootstrap}")
-                logger.info(f"  Confidence level: {args.confidence_level}")
-                irf = var_results.irf(args.irf_periods)
-                # Note: bootstrap for error bands
                 irf_boot = irf.errband_mc(
                     orth=use_orth,
                     repl=args.n_bootstrap,
                     signif=1 - args.confidence_level,
                     seed=args.seed,
                 )
+                logger.info(f"✓ Bootstrap confidence intervals computed")
 
-            else:
-                irf = var_results.irf(args.irf_periods)
-                irf_boot = None
-                logger.info("  Bootstrap: disabled")
+            irf_values = irf.orth_irfs if use_orth else irf.irfs
+            logger.info(f"✓ IRF computed, shape: {irf_values.shape}")
 
-            # Extract IRF values
-            if use_orth:
-                irf_values = irf.orth_irfs  # Orthogonalized
-                logger.info("✓ Using orthogonalized IRF")
-            else:
-                irf_values = irf.irfs  # Non-orthogonalized
-                logger.info("✓ Using non-orthogonalized IRF")
-
-            logger.info(f"✓ IRF computed")
-            logger.info(f"  Shape: {irf_values.shape}")
-            logger.info(f"  (periods={irf_values.shape[0]}, n_vars={irf_values.shape[1]}, n_vars={irf_values.shape[2]})")
-
-            # Create Schema JSON — recoverycurve format
-            logger.info("=" * 60)
-            logger.info("Creating Schema JSON")
-            logger.info("=" * 60)
-
-            current_timestamp = time.time()
-
-            # Convert numpy array to nested list for JSON serialization
-            irf_values_list = irf_values.tolist()
-
+            # ── Save Schema JSON ───────────────────────────────────────
             schema_data = {
                 "recoverycurve": {
                     "shape": list(irf_values.shape),
-                    "values": irf_values_list
+                    "values": irf_values.tolist()
                 },
-                "timestamp": current_timestamp,
+                "timestamp": time.time(),
                 "metadata": {
                     "var_lags": args.var_lags,
                     "irf_periods": args.irf_periods,
@@ -247,147 +163,6 @@ implementation:
                 json.dump(schema_data, f, indent=4)
 
             logger.info(f"✓ Schema JSON saved: {args.schema_json}")
-            logger.info(f"  recoverycurve shape: {irf_values.shape}")
-            logger.info(f"  timestamp: {current_timestamp}")
-
-            # Save Full IRF Results
-            logger.info("=" * 60)
-            logger.info("Saving Full IRF Results")
-            logger.info("=" * 60)
-
-            os.makedirs(args.irf_results, exist_ok=True)
-
-            # Save IRF arrays as numpy
-            np.save(os.path.join(args.irf_results, "irf_values.npy"), irf_values)
-            if use_orth:
-                np.save(os.path.join(args.irf_results, "irf_orth.npy"), irf.orth_irfs)
-            else:
-                np.save(os.path.join(args.irf_results, "irf_raw.npy"), irf.irfs)
-
-            # Save cumulative IRF
-            if use_orth:
-                cum_effects = irf.orth_cum_effects
-            else:
-                cum_effects = irf.cum_effects
-            np.save(os.path.join(args.irf_results, "irf_cumulative.npy"), cum_effects)
-
-            logger.info(f"✓ IRF arrays saved")
-
-            # Save error bands if available
-            if irf_boot is not None:
-                np.save(os.path.join(args.irf_results, "irf_lower.npy"), irf_boot[0])
-                np.save(os.path.join(args.irf_results, "irf_upper.npy"), irf_boot[1])
-                logger.info(f"✓ Bootstrap confidence intervals saved")
-
-            # Create DataFrames for each impulse-response pair
-            irf_dfs = []
-            var_names = list(data.columns)
-
-            for impulse_idx, impulse_var in enumerate(var_names):
-                for response_idx, response_var in enumerate(var_names):
-                    periods = list(range(irf_values.shape[0]))
-                    values = irf_values[:, response_idx, impulse_idx]
-
-                    df = pd.DataFrame({
-                        'period': periods,
-                        'impulse_variable': impulse_var,
-                        'response_variable': response_var,
-                        'irf_value': values
-                    })
-
-                    if irf_boot is not None:
-                        df['lower_ci'] = irf_boot[0][:, response_idx, impulse_idx]
-                        df['upper_ci'] = irf_boot[1][:, response_idx, impulse_idx]
-
-                    irf_dfs.append(df)
-
-            irf_full_df = pd.concat(irf_dfs, ignore_index=True)
-            irf_csv_path = os.path.join(args.irf_results, "irf_results.csv")
-            irf_full_df.to_csv(irf_csv_path, index=False)
-            logger.info(f"✓ IRF results saved: {irf_csv_path}")
-
-            # Metadata
-            with open(os.path.join(args.irf_results, "irf_metadata.json"), "w") as f:
-                json.dump({
-                    "var_lags": args.var_lags,
-                    "irf_periods": args.irf_periods,
-                    "orthogonalized": use_orth,
-                    "n_variables": len(var_names),
-                    "variables": var_names,
-                    "n_bootstrap": args.n_bootstrap,
-                    "confidence_level": args.confidence_level,
-                    "shape": list(irf_values.shape),
-                }, f, indent=2)
-
-            # ============================================
-            # Save VAR Diagnostics
-            # ============================================
-            logger.info("=" * 60)
-            logger.info("Saving VAR Diagnostics")
-            logger.info("=" * 60)
-
-            os.makedirs(args.var_diagnostics, exist_ok=True)
-
-            # Model summary
-            summary_path = os.path.join(args.var_diagnostics, "var_summary.txt")
-            with open(summary_path, "w") as f:
-                f.write(str(var_results.summary()))
-            logger.info(f"✓ VAR summary saved: {summary_path}")
-
-            # Information criteria
-            ic_dict = {
-                "aic": float(var_results.aic),
-                "bic": float(var_results.bic),
-                "fpe": float(var_results.fpe),
-                "hqic": float(var_results.hqic),
-                "loglike": float(var_results.loglike),
-                "detomega": float(var_results.detomega),
-                "nobs": int(var_results.nobs),
-                "k_ar": int(var_results.k_ar),
-                "neqs": int(var_results.neqs),
-            }
-
-            ic_path = os.path.join(args.var_diagnostics, "information_criteria.json")
-            with open(ic_path, "w") as f:
-                json.dump(ic_dict, f, indent=2)
-            logger.info(f"✓ Information criteria saved: {ic_path}")
-
-            # Fitted values and residuals
-            fitted_df = pd.DataFrame(
-                var_results.fittedvalues,
-                index=data.index[args.var_lags:],
-                columns=[f"{col}_fitted" for col in data.columns]
-            )
-            fitted_df.to_csv(os.path.join(args.var_diagnostics, "fitted_values.csv"))
-
-            resid_df = pd.DataFrame(
-                var_results.resid,
-                index=data.index[args.var_lags:],
-                columns=[f"{col}_residual" for col in data.columns]
-            )
-            resid_df.to_csv(os.path.join(args.var_diagnostics, "residuals.csv"))
-            logger.info(f"✓ Fitted values and residuals saved")
-
-            # Coefficient matrices
-            for i, coef_matrix in enumerate(var_results.params.T):
-                coef_df = pd.DataFrame(
-                    coef_matrix.reshape(1, -1),
-                    columns=var_results.params.index
-                )
-                coef_df.to_csv(
-                    os.path.join(args.var_diagnostics, f"coefficients_eq{i+1}.csv"),
-                    index=False
-                )
-            logger.info(f"✓ Coefficient matrices saved")
-
-            logger.info("=" * 60)
-            logger.info("✓ VAR IRF Computation Complete!")
-            logger.info("=" * 60)
-            logger.info(f"  Schema JSON     : {args.schema_json}")
-            logger.info(f"  IRF results     : {args.irf_results}")
-            logger.info(f"  VAR diagnostics : {args.var_diagnostics}")
-            logger.info(f"  Shape           : {irf_values.shape}")
-            logger.info(f"  Variables       : {var_names}")
 
         except Exception as e:
             logger.exception(f"Fatal error: {str(e)}")
@@ -402,10 +177,6 @@ implementation:
       - {inputValue: irf_periods}
       - --orthogonalized
       - {inputValue: orthogonalized}
-      - --impulse_variable
-      - {inputValue: impulse_variable}
-      - --response_variable
-      - {inputValue: response_variable}
       - --confidence_level
       - {inputValue: confidence_level}
       - --n_bootstrap
@@ -414,7 +185,3 @@ implementation:
       - {inputValue: seed}
       - --schema_json
       - {outputPath: schema_json}
-      - --irf_results
-      - {outputPath: irf_results}
-      - --var_diagnostics
-      - {outputPath: var_diagnostics}
