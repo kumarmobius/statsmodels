@@ -1,4 +1,4 @@
-name: VAR Impulse Response Function Calculator v1.3
+name: VAR Impulse Response Function 1.4
 inputs:
   - {name: input_data, type: Data, description: "Input time series data (CSV or Parquet with datetime index)"}
   - {name: var_lags, type: Integer, description: "Number of lags for VAR model", default: "10"}
@@ -160,10 +160,12 @@ implementation:
             var_results.sigma_u     = var_results.sigma_u     + epsilon * eye
             var_results.sigma_u_mle = var_results.sigma_u_mle + epsilon * eye
             
-            # Clear all cached properties that depend on the covariance matrix
             for cached_attr in ('_cov_params', 'info_criteria', '_lag_order_results'):
-                if hasattr(var_results, cached_attr):
-                    delattr(var_results, cached_attr)
+                try:
+                    if cached_attr in vars(var_results):
+                        delattr(var_results, cached_attr)
+                except (AttributeError, TypeError):
+                    pass
             
             logger.info(f"✓ Covariance matrix regularized (epsilon={epsilon})")
             
