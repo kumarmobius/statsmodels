@@ -194,10 +194,10 @@ implementation:
                 irf_boot = irf.errband_mc(
                     orth=use_orth,
                     repl=args.n_bootstrap,
-                    T=args.irf_periods,
                     signif=1 - args.confidence_level,
                     seed=args.seed,
                 )
+
             else:
                 irf = var_results.irf(args.irf_periods)
                 irf_boot = None
