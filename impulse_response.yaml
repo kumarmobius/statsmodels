@@ -1,4 +1,4 @@
-name: VAR Impulse Response Function 1.4
+name: VAR Impulse Response Function 1.5
 inputs:
   - {name: input_data, type: Data, description: "Input time series data (CSV or Parquet with datetime index)"}
   - {name: var_lags, type: Integer, description: "Number of lags for VAR model", default: "10"}
@@ -191,9 +191,13 @@ implementation:
                 logger.info(f"  Confidence level: {args.confidence_level}")
                 irf = var_results.irf(args.irf_periods)
                 # Note: bootstrap for error bands
-                irf_boot = irf.errband_mc(alpha=1-args.confidence_level, 
-                                          repl=args.n_bootstrap, 
-                                          seed=args.seed)
+                irf_boot = irf.errband_mc(
+                    orth=use_orth,
+                    repl=args.n_bootstrap,
+                    T=args.irf_periods,
+                    signif=1 - args.confidence_level,
+                    seed=args.seed,
+                )
             else:
                 irf = var_results.irf(args.irf_periods)
                 irf_boot = None
