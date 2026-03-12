@@ -1,8 +1,9 @@
-name: Dataset downloader and preprocessor (Parquet output)
+name: Dataset downloader and preprocessor V1
 inputs:
   - {name: data_cdn, type: String, optional: false}
   - {name: apply_scaling, type: String, optional: true, default: "true"}
   - {name: convert_to_float16, type: String, optional: true, default: "false"}
+  - {name: no_of_columns, type: String, optional: true, default: "-1"}
 
 outputs:
   - {name: preprocessed_output, type: Data}
@@ -32,6 +33,7 @@ implementation:
         parser.add_argument('--data_cdn', required=True)
         parser.add_argument('--apply_scaling', type=str, default='true')
         parser.add_argument('--convert_to_float16', type=str, default='false')
+        parser.add_argument('--no_of_columns', type=str, default='-1')
         parser.add_argument('--preprocessed_output', required=True)
         parser.add_argument('--scaler_output', required=True)
         args = parser.parse_args()
@@ -41,11 +43,13 @@ implementation:
 
         apply_scaling      = args.apply_scaling.lower() in ('true', '1', 'yes')
         convert_to_float16 = args.convert_to_float16.lower() in ('true', '1', 'yes')
+        no_of_columns      = int(args.no_of_columns)
 
         logger.info("=" * 60)
         logger.info("Configuration:")
         logger.info(f"  Apply StandardScaler  : {apply_scaling}")
         logger.info(f"  Convert to float16    : {convert_to_float16}")
+        logger.info(f"  No. of columns        : {'All' if no_of_columns <= 0 else no_of_columns}")
         logger.info("=" * 60)
 
         # ── Retry-enabled session ──────────────────────────────────────────
@@ -96,7 +100,7 @@ implementation:
             logger.info("Downloaded to: %s", tmp)
             return tmp
 
-        def load_data(file_path):
+        def load_data(file_path, n_cols=-1):
             strategies = [
                 ('PyTorch .pt',  lambda: torch.load(file_path, map_location='cpu').numpy()),
                 ('NumPy .npy',   lambda: np.load(file_path, allow_pickle=True)),
@@ -115,6 +119,20 @@ implementation:
                         data = data.numpy()
                     data = np.array(data, dtype=np.float32)
                     logger.info("✓ Loaded as %s — shape: %s", name, data.shape)
+
+                    # ── Column slicing ─────────────────────────────────────
+                    if n_cols > 0:
+                        if data.ndim < 2:
+                            logger.warning("⚠ no_of_columns ignored — data is 1-D (shape: %s)", data.shape)
+                        elif n_cols > data.shape[1]:
+                            logger.warning(
+                                "⚠ no_of_columns (%d) exceeds available columns (%d) — loading all columns",
+                                n_cols, data.shape[1]
+                            )
+                        else:
+                            data = data[:, :n_cols]
+                            logger.info("✓ Column slicing applied — new shape: %s", data.shape)
+
                     return data
                 except Exception as e:
                     last_err = e
@@ -135,9 +153,9 @@ implementation:
 
         # ── Main pipeline ──────────────────────────────────────────────────
         try:
-            # 1. Download & load
+            # 1. Download & load (with optional column slicing)
             tmp_file = download_file(args.data_cdn)
-            data = load_data(tmp_file)
+            data = load_data(tmp_file, n_cols=no_of_columns)
             os.remove(tmp_file)
 
             # 2. Debug raw
@@ -205,6 +223,7 @@ implementation:
             logger.info("  Final dtype    : %s", data.dtype)
             logger.info("  Scaling applied: %s", apply_scaling)
             logger.info("  Float16        : %s", convert_to_float16)
+            logger.info("  Columns used   : %s", data.shape[1] if data.ndim == 2 else 'N/A (1-D)')
             logger.info("=" * 60)
 
         except Exception as e:
@@ -218,6 +237,8 @@ implementation:
       - {inputValue: apply_scaling}
       - --convert_to_float16
       - {inputValue: convert_to_float16}
+      - --no_of_columns
+      - {inputValue: no_of_columns}
       - --preprocessed_output
       - {outputPath: preprocessed_output}
       - --scaler_output
